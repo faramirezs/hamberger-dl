@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # hamberger-dl — download invoices from the Hamberger customer portal
-# (mein.hamberger-cc.de) without opening the app.
+# without opening the app. Requires a Hamberger customer account
+# (username + password), entered once via the "login" command.
 #
 # Auth: Keycloak OpenID Connect, client "KUNDEN APP", PKCE (S256).
 #       Tokens cached in ~/.config/hamberger/tokens.json (chmod 600).
@@ -16,7 +17,7 @@
 #   hamberger-dl login            force interactive login (seeds token cache)
 #
 # Filters: --type RECHNUNG|GUTSCHRIFT, --after/--before YYYY-MM-DD (invoice date).
-# Requires: curl, python3, openssl, uuidgen (all present on macOS).
+# Requires: curl, python3, openssl (macOS or Linux).
 set -euo pipefail
 
 REALM='HAMBERGER GROSSMARKT'
@@ -107,8 +108,8 @@ auth_login() {
 
   verifier=$(python3 -c 'import secrets,base64;print(base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode())')
   challenge=$(printf %s "$verifier" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=')
-  state=$(uuidgen | tr '[:upper:]' '[:lower:]')
-  nonce=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  state=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  nonce=$(python3 -c 'import uuid; print(uuid.uuid4())')
 
   page=$(curl -sS --max-time 30 -c "$cookie_jar" -G "$BASE_AUTH/protocol/openid-connect/auth" \
     --data-urlencode "client_id=$CLIENT_ID" \
@@ -301,6 +302,7 @@ Examples:
   hamberger-dl zip --after 2026-01-01 --type RECHNUNG
 
 Notes:
+  - Requires a Hamberger customer account (username + password).
   - The password is never stored; only short-lived tokens are cached in
     ~/.config/hamberger/tokens.json (mode 600).
   - Downloading is skipped for PDFs that already exist in the output dir.

@@ -1,6 +1,6 @@
 # hamberger-dl
 
-Download invoices from the Hamberger customer portal (mein.hamberger-cc.de) from the command line — no app needed.
+Download invoices from the Hamberger customer portal from the command line — no app needed.
 
 - Lists your invoices as plain text
 - Downloads PDFs, one by one or as a single ZIP
@@ -9,7 +9,8 @@ Download invoices from the Hamberger customer portal (mein.hamberger-cc.de) from
 
 ## Requirements
 
-macOS with `curl`, `python3`, `openssl`, and `uuidgen` (all ship with macOS by default).
+- macOS or Linux with `curl`, `python3`, and `openssl`
+- A Hamberger customer account. You log in with the same username and password you use on the customer portal (this is what the `login` step is for).
 
 ## Install
 
@@ -30,6 +31,8 @@ chmod +x ~/bin/hamberger-dl
 ```
 
 ## Quick start
+
+> You'll need a Hamberger customer account. The `login` step asks for the username and password you use on the portal — they are never stored.
 
 ```sh
 hamberger-dl login        # once: asks for your portal username and password
