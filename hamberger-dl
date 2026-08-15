@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+#
+# hamberger-dl — download invoices from the Hamberger customer portal
+# (mein.hamberger-cc.de) without opening the app.
+#
+# Auth: Keycloak OpenID Connect, client "KUNDEN APP", PKCE (S256).
+#       Tokens cached in ~/.config/hamberger/tokens.json (chmod 600).
+#       An offline refresh token is minted at login and reused; a new
+#       interactive login is only prompted when Keycloak rejects it.
+#
+# Usage:
+#   hamberger-dl help
+#   hamberger-dl list [--after YYYY-MM-DD] [--before YYYY-MM-DD] [--type TYPE]
+#   hamberger-dl download [ID...] [filters] [--out DIR] [--overwrite]
+#   hamberger-dl zip [ID...] [filters] [--out DIR]
+#   hamberger-dl login            force interactive login (seeds token cache)
+#
+# Filters: --type RECHNUNG|GUTSCHRIFT, --after/--before YYYY-MM-DD (invoice date).
+# Requires: curl, python3, openssl, uuidgen (all present on macOS).
+set -euo pipefail
+
+REALM='HAMBERGER GROSSMARKT'
+CLIENT_ID='KUNDEN APP'
+REDIRECT_URI='https://mein.hamberger-cc.de/#/guidance'
+BASE_AUTH='https://login.hamberger-cc.de/auth/realms/HAMBERGER%20GROSSMARKT'
+BASE_API='https://mein.hamberger-cc.de'
+CFG_DIR="${HAMBERGER_CFG_DIR:-$HOME/.config/hamberger}"
+TOKENS_FILE="$CFG_DIR/tokens.json"
+OUT_DIR="${HAMBERGER_OUT_DIR:-$HOME/Downloads/Hamberger}"
+
+ACCESS='' REFRESH='' EXPIRES_AT=0
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# ---------- token cache ----------
+token_load() {
+  read -r ACCESS < <(python3 - "$TOKENS_FILE" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(d.get('access_token', ''))
+PY
+)
+  read -r REFRESH < <(python3 - "$TOKENS_FILE" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(d.get('refresh_token', ''))
+PY
+)
+  EXPIRES_AT=$(python3 - "$TOKENS_FILE" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); sys.exit(0)
+print(int(d.get('access_expires_at', 0) or 0))
+PY
+)
+}
+
+token_save() {
+  mkdir -p "$CFG_DIR" && chmod 700 "$CFG_DIR"
+  python3 - "$TOKENS_FILE" "$ACCESS" "$REFRESH" "$EXPIRES_AT" <<'PY'
+import json, os, sys, time
+path, acc, ref, exp = sys.argv[1:5]
+d = {"access_token": acc, "refresh_token": ref,
+     "access_expires_at": int(exp), "saved_at": int(time.time())}
+with open(path, 'w') as f:
+    json.dump(d, f, indent=2)
+os.chmod(path, 0o600)
+PY
+}
+
+# ---------- auth ----------
+# Try refresh_token grant; returns 0 on success, 1 when the grant is rejected.
+auth_refresh() {
+  local out
+  out=$(curl -sS --max-time 30 -X POST "$BASE_AUTH/protocol/openid-connect/token" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'grant_type=refresh_token' \
+    --data-urlencode "refresh_token=$REFRESH" \
+    --data-urlencode "client_id=$CLIENT_ID") || return 1
+  if ! echo "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("access_token") else 1)' 2>/dev/null; then
+    return 1
+  fi
+  ACCESS=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+  local new_refresh exp_in
+  new_refresh=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("refresh_token",""))')
+  [ -n "$new_refresh" ] && REFRESH=$new_refresh
+  exp_in=$(echo "$out" | python3 -c 'import json,sys; print(int(json.load(sys.stdin).get("expires_in",3600)))')
+  EXPIRES_AT=$(( $(date +%s) + exp_in ))
+  token_save
+  return 0
+}
+
+# Full interactive Keycloak login with PKCE. Prompts for username/password.
+auth_login() {
+  local cookie_jar headers verifier challenge state nonce page form_action
+  local location code out
+  cookie_jar=$(mktemp); headers=$(mktemp)
+  trap 'rm -f "$cookie_jar" "$headers"' RETURN
+
+  verifier=$(python3 -c 'import secrets,base64;print(base64.urlsafe_b64encode(secrets.token_bytes(48)).rstrip(b"=").decode())')
+  challenge=$(printf %s "$verifier" | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=')
+  state=$(uuidgen | tr '[:upper:]' '[:lower:]')
+  nonce=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+  page=$(curl -sS --max-time 30 -c "$cookie_jar" -G "$BASE_AUTH/protocol/openid-connect/auth" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "redirect_uri=$REDIRECT_URI" \
+    --data-urlencode 'response_mode=fragment' \
+    --data-urlencode 'response_type=code' \
+    --data-urlencode 'scope=openid offline_access' \
+    --data-urlencode "state=$state" \
+    --data-urlencode "nonce=$nonce" \
+    --data-urlencode "code_challenge=$challenge" \
+    --data-urlencode 'code_challenge_method=S256') || die "auth page request failed"
+
+  form_action=$(printf %s "$page" | python3 -c 'import re,sys; h=sys.stdin.read(); m=re.search(r"<form[^>]*action=\"([^\"]+)\"",h); print(m.group(1) if m else "")')
+  [ -n "$form_action" ] || die "login form not found on auth page"
+
+  read -r -p "Username: " USERNAME
+  read -r -s -p "Password: " PASSWORD; echo
+  [ -n "$USERNAME" ] || die "empty username"
+
+  local args=()
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    args+=( --data-urlencode "$f" )
+  done < <(printf %s "$page" | python3 -c '
+import re, sys
+html = sys.stdin.read()
+user, passwd = sys.argv[1], sys.argv[2]
+for name, value in re.findall(r"<input[^>]*name=\"([^\"]*)\"[^>]*value=\"([^\"]*)\"", html):
+    print("%s=%s" % (name, value))
+print("username=%s" % user)
+print("password=%s" % passwd)
+' "$USERNAME" "$PASSWORD")
+
+  curl -sS --max-time 60 -b "$cookie_jar" -c "$cookie_jar" -D "$headers" -o /dev/null \
+    -X POST "$form_action" "${args[@]}" || die "login POST failed"
+  location=$(sed -n 's/^[Ll]ocation: //p' "$headers" | tr -d '\r')
+  [ -n "$location" ] || die "login did not redirect (wrong credentials?)"
+  code=$(printf %s "$location" | sed -n 's/.*code=\([^&"]*\).*/\1/p')
+  [ -n "$code" ] || die "no authorization code in redirect: $location"
+
+  out=$(curl -sS --max-time 30 -X POST "$BASE_AUTH/protocol/openid-connect/token" \
+    -H 'Content-Type: application/x-www-form-urlencoded' \
+    --data-urlencode 'grant_type=authorization_code' \
+    --data-urlencode "code=$code" \
+    --data-urlencode "client_id=$CLIENT_ID" \
+    --data-urlencode "redirect_uri=$REDIRECT_URI" \
+    --data-urlencode "code_verifier=$verifier") || die "token exchange failed"
+  ACCESS=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+  REFRESH=$(echo "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["refresh_token"])')
+  EXPIRES_AT=$(( $(date +%s) + $(echo "$out" | python3 -c 'import json,sys; print(int(json.load(sys.stdin)["expires_in"]))') ))
+  token_save
+  echo "login OK — tokens cached in $TOKENS_FILE"
+}
+
+# Ensure we hold a usable access token.
+ensure_token() {
+  token_load
+  if [ -n "$ACCESS" ] && [ "$EXPIRES_AT" -gt "$(date +%s)" ]; then return 0; fi
+  if [ -n "$REFRESH" ] && auth_refresh; then return 0; fi
+  auth_login
+}
+
+# ---------- API ----------
+api_get() { # path, accept
+  curl -sfS --max-time 120 -H "Authorization: Bearer $ACCESS" -H "Accept: $2" "$BASE_API$1"
+}
+
+# Invoice JSON -> TSV: date<TAB>type<TAB>gross<TAB>id  (applies filters)
+fetch_invoices_tsv() {
+  api_get /invoice/api/document 'application/json, text/plain, */*' \
+  | python3 -c '
+import json, sys
+after, before, itype = sys.argv[1], sys.argv[2], sys.argv[3]
+invoices = json.load(sys.stdin)
+rows = []
+for inv in invoices:
+    ts = (inv.get("ts") or "")[:10]
+    if after and ts < after: continue
+    if before and ts > before: continue
+    if itype and inv.get("invoiceType") != itype: continue
+    rows.append((ts, inv.get("invoiceType", ""), inv.get("gross", ""), inv.get("id", "")))
+rows.sort()
+for r in rows:
+    print("\t".join(r))
+' "$AFTER" "$BEFORE" "$ITYPE"
+}
+
+# ---------- commands ----------
+cmd_list() {
+  local tsv
+  tsv=$(fetch_invoices_tsv)
+  if [ -z "$tsv" ]; then echo "no invoices match"; return 0; fi
+  printf 'date\ttype\tgross\tid\n'
+  echo "$tsv"
+  echo "count: $(echo "$tsv" | wc -l | tr -d ' ')"
+}
+
+cmd_download() {
+  ensure_token
+  mkdir -p "$OUT_DIR"
+  local ids=() tsv line id ts out_file
+  if [ "$#" -eq 0 ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      ts=$(printf %s "$line" | cut -f1); id=$(printf %s "$line" | cut -f4)
+      ids+=( "$id" )
+    done <<< "$(fetch_invoices_tsv)"
+  else
+    ids=( "$@" )
+  fi
+  [ "${#ids[@]}" -gt 0 ] || die "no invoices to download (check filters)"
+  local n=0
+  for id in "${ids[@]}"; do
+    out_file="$OUT_DIR/$id.pdf"
+    if [ -f "$out_file" ] && [ "$OVERWRITE" != 1 ]; then
+      echo "skip  $id (exists)"
+      continue
+    fi
+    if curl -sfS --max-time 120 -H "Authorization: Bearer $ACCESS" \
+         -H 'Accept: application/pdf' -o "$out_file" \
+         "$BASE_API/invoice/api/document/$id"; then
+      echo "saved $id -> $out_file"
+      n=$((n+1))
+    else
+      echo "FAIL  $id" >&2
+    fi
+  done
+  echo "downloaded $n invoice(s) to $OUT_DIR"
+}
+
+cmd_zip() {
+  ensure_token
+  mkdir -p "$OUT_DIR"
+  local ids=() line id
+  if [ "$#" -eq 0 ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      id=$(printf %s "$line" | cut -f4)
+      ids+=( "$id" )
+    done <<< "$(fetch_invoices_tsv)"
+  else
+    ids=( "$@" )
+  fi
+  [ "${#ids[@]}" -gt 0 ] || die "no invoices to zip (check filters)"
+  local payload out_file
+  payload=$(python3 -c 'import json,sys; print(json.dumps({"invoices": sys.argv[1:]}))' "${ids[@]}")
+  out_file="$OUT_DIR/invoices-$(date +%Y%m%d-%H%M%S).zip"
+  if curl -sfS --max-time 300 -X POST "$BASE_API/invoice/api/document/package" \
+       -H "Authorization: Bearer $ACCESS" \
+       -H 'Content-Type: application/json' \
+       -H 'Accept: application/zip,*/*' \
+       -d "$payload" -o "$out_file"; then
+    echo "saved ZIP ($(echo "${#ids[@]}" | tr -d ' ') invoice(s)) -> $out_file"
+  else
+    die "zip request failed"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+hamberger-dl — download invoices from the Hamberger customer portal
+
+Usage:
+  hamberger-dl help
+  hamberger-dl login
+  hamberger-dl list [filters]
+  hamberger-dl download [ID...] [filters] [--out DIR] [--overwrite]
+  hamberger-dl zip [ID...] [filters] [--out DIR]
+
+Commands:
+  help       show this help
+  login      log in and cache tokens (needed once; runs automatically when
+             cached tokens expire)
+  list       list invoices as: date <TAB> type <TAB> gross <TAB> id
+  download   save invoice PDFs (default: all invoices matching the filters)
+  zip        save one ZIP containing the selected invoice PDFs
+
+Options / filters:
+  --after YYYY-MM-DD   only invoices dated on/after this date
+  --before YYYY-MM-DD  only invoices dated on/before this date
+  --type TYPE          only RECHNUNG or GUTSCHRIFT
+  --out DIR            output directory (default: ~/Downloads/Hamberger)
+  --overwrite          re-download PDFs that already exist
+
+Examples:
+  hamberger-dl login
+  hamberger-dl list --after 2026-07-01
+  hamberger-dl download --after 2026-07-01
+  hamberger-dl download 26-008-7823899 --out ~/Documents/invoices
+  hamberger-dl zip --after 2026-01-01 --type RECHNUNG
+
+Notes:
+  - The password is never stored; only short-lived tokens are cached in
+    ~/.config/hamberger/tokens.json (mode 600).
+  - Downloading is skipped for PDFs that already exist in the output dir.
+
+Install:
+  curl -fsSL https://raw.githubusercontent.com/faramirezs/hamberger-dl/main/install.sh | bash
+EOF
+}
+
+# ---------- main ----------
+need_val() { [ "$#" -ge 2 ] || die "option $1 requires a value"; }
+AFTER='' BEFORE='' ITYPE='' OVERWRITE=0
+CMD=''
+ARGS=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --after) need_val "$@"; AFTER=$2; shift 2 ;;
+    --before) need_val "$@"; BEFORE=$2; shift 2 ;;
+    --type) need_val "$@"; ITYPE=$2; shift 2 ;;
+    --out) need_val "$@"; OUT_DIR=$2; shift 2 ;;
+    --overwrite) OVERWRITE=1; shift ;;
+    list|download|zip|login|help) CMD=$1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) die "unknown option: $1" ;;
+    *) ARGS+=( "$1" ); shift ;;
+  esac
+done
+case "$CMD" in
+  list)     ensure_token; cmd_list ;;
+  download) cmd_download "${ARGS[@]+"${ARGS[@]}"}" ;;
+  zip)      cmd_zip "${ARGS[@]+"${ARGS[@]}"}" ;;
+  login)    auth_login ;;
+  help)     usage ;;
+  *)        usage; exit 1 ;;
+esac
