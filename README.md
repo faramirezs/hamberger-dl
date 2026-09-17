@@ -1,6 +1,6 @@
 # hamberger-dl
 
-Download invoices from the Hamberger customer portal from the command line — no app needed.
+Download invoices from the Hamberger customer portal from the command line, no app needed.
 
 - Lists your invoices as plain text
 - Downloads PDFs, one by one or as a single ZIP
@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/faramirezs/hamberger-dl/main/instal
 
 This installs `hamberger-dl` into `~/bin` (override with `HAMBERGER_INSTALL_DIR`, e.g. `~/.local/bin`). If `~/bin` is not on your PATH, the installer prints the line to add it.
 
-Manual install — copy the script anywhere on your PATH and make it executable:
+Manual install: copy the script anywhere on your PATH and make it executable:
 
 ```sh
 mkdir -p ~/bin
@@ -32,7 +32,7 @@ chmod +x ~/bin/hamberger-dl
 
 ## Quick start
 
-> You'll need a Hamberger customer account. The `login` step asks for the username and password you use on the portal — they are never stored.
+> You'll need a Hamberger customer account. The `login` step asks for the username and password you use on the portal; they are never stored.
 
 ```sh
 hamberger-dl login        # once: asks for your portal username and password
@@ -85,6 +85,6 @@ rm -rf ~/.config/hamberger
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT: see [LICENSE](LICENSE).
 
 *Unofficial tool, not affiliated with Hamberger.*
